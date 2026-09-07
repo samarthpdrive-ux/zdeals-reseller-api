@@ -1,4 +1,4 @@
-"""Public Wasmer gateway for NomanBot reseller API.
+"""Public Wasmer gateway for the ZDeals Bot reseller API.
 
 This app intentionally stores no secrets in source code.  It accepts public
 requests at ``/api/v1/*`` and forwards only permitted routes to the bot's
@@ -43,7 +43,7 @@ def _json_bytes(data: dict) -> bytes:
 
 
 class GatewayHandler(BaseHTTPRequestHandler):
-    server_version = "NomanWasmerGateway/1.0"
+    server_version = "ZDealsBotResellerAPI/1.0"
 
     def log_message(self, format: str, *args: object) -> None:
         # Do not log authorization headers, URLs, or request bodies.
@@ -125,8 +125,8 @@ class GatewayHandler(BaseHTTPRequestHandler):
         self._proxy("POST")
 
     def _home(self) -> None:
-        page = """<!doctype html><html><head><meta charset=\"utf-8\"><title>Reseller API</title></head>
-<body><h1>Reseller API</h1><p>Open <a href=\"/docs\">/docs</a> for interactive developer documentation.</p></body></html>"""
+        page = """<!doctype html><html><head><meta charset=\"utf-8\"><title>ZDeals Bot Developer API</title></head>
+<body><h1>ZDeals Bot Developer API</h1><p>Open <a href=\"/docs\">/docs</a> for interactive developer documentation.</p></body></html>"""
         self._send(200, page.encode("utf-8"), "text/html; charset=utf-8")
 
     def _docs(self) -> None:
@@ -134,9 +134,9 @@ class GatewayHandler(BaseHTTPRequestHandler):
         # dependency-free standard-library Python application on Wasmer.
         page = """<!doctype html><html><head><meta charset=\"utf-8\">
 <meta name=\"viewport\" content=\"width=device-width, initial-scale=1\">
-<title>NomanBot Reseller API</title>
+<title>ZDeals Bot Developer API</title>
 <link rel=\"stylesheet\" href=\"https://unpkg.com/swagger-ui-dist@5/swagger-ui.css\">
-<style>body{margin:0;background:#fafafa}.topbar{display:none}</style></head>
+<style>body{margin:0;background:#fafafa}.topbar{display:none}.swagger-ui .info .title{color:#116149}</style></head>
 <body><div id=\"swagger-ui\"></div>
 <script src=\"https://unpkg.com/swagger-ui-dist@5/swagger-ui-bundle.js\"></script>
 <script>window.ui=SwaggerUIBundle({url:'/openapi.json',dom_id:'#swagger-ui',deepLinking:true,persistAuthorization:false,displayRequestDuration:true,tryItOutEnabled:true});</script>
@@ -150,12 +150,17 @@ class GatewayHandler(BaseHTTPRequestHandler):
         return {
             "openapi": "3.0.3",
             "info": {
-                "title": "NomanBot Reseller API",
+                "title": "ZDeals Bot Developer API",
                 "version": "1.0.0",
                 "description": (
-                    "Sell NomanBot products from your own bot or website. Your API key uses "
-                    "your Telegram wallet balance and your custom product rates. Keep it on "
-                    "your server; never put it in browser JavaScript.\\n\\n"
+                    "Sell ZDeals Bot products from your own bot or website. Your API key uses "
+                    "your Telegram wallet balance and your custom product rates.\\n\\n"
+                    "### Test API Key\\n"
+                    "Click **Authorize** above, enter your `AK_...` key in **Test API Key**, then use **Try it out** on any endpoint. The key is not saved after you close this page.\\n\\n"
+                    "### Source examples\\n"
+                    "**cURL**\\n```bash\\ncurl -H \"Authorization: Bearer YOUR_API_KEY\" https://YOUR-WASMER-DOMAIN/api/reseller/products\\n```\\n"
+                    "**Python**\\n```python\\nimport requests\\nAPI_KEY = 'AK_your_api_key'\\nBASE_URL = 'https://YOUR-WASMER-DOMAIN'\\nresponse = requests.get(f'{BASE_URL}/api/reseller/products', headers={'Authorization': f'Bearer {API_KEY}'}, timeout=30)\\nprint(response.json())\\n```\\n\\n"
+                    "Keep API keys on your server. Never place them in website JavaScript, HTML, or GitHub.\\n\\n"
                     "Rate limit: 3 requests per second per API key. Orders are safe to retry "
                     "when you reuse the same external_order_id."
                 ),
@@ -166,14 +171,14 @@ class GatewayHandler(BaseHTTPRequestHandler):
                 "/api/reseller/products": {
                     "get": {
                         "tags": ["Reseller API"], "summary": "List products", "operationId": "listProducts",
-                        "security": [{"bearerAuth": []}],
+                        "security": [{"Test API Key": []}],
                         "responses": {"200": {**success, "content": {"application/json": {"schema": {"$ref": "#/components/schemas/ProductsResponse"}}}}, "401": {"description": "Missing or invalid API key", "content": {"application/json": {"schema": error}}}},
                     }
                 },
                 "/api/reseller/balance": {
                     "get": {
                         "tags": ["Reseller API"], "summary": "Get wallet balance", "operationId": "getBalance",
-                        "security": [{"bearerAuth": []}],
+                        "security": [{"Test API Key": []}],
                         "responses": {"200": {**success, "content": {"application/json": {"schema": {"$ref": "#/components/schemas/BalanceResponse"}}}}, "401": {"description": "Missing or invalid API key", "content": {"application/json": {"schema": error}}}},
                     }
                 },
@@ -181,7 +186,7 @@ class GatewayHandler(BaseHTTPRequestHandler):
                     "post": {
                         "tags": ["Reseller API"], "summary": "Create an order", "operationId": "createOrder",
                         "description": "external_order_id must be unique for every purchase. Reuse it only when retrying the same order after a timeout.",
-                        "security": [{"bearerAuth": []}],
+                        "security": [{"Test API Key": []}],
                         "requestBody": {"required": True, "content": {"application/json": {"schema": {"$ref": "#/components/schemas/CreateOrderRequest"}}}},
                         "responses": {"200": {**success, "content": {"application/json": {"schema": {"$ref": "#/components/schemas/OrderResponse"}}}}, "400": {"description": "Invalid order or insufficient balance", "content": {"application/json": {"schema": error}}}, "404": {"description": "Product not found", "content": {"application/json": {"schema": error}}}},
                     }
@@ -189,21 +194,21 @@ class GatewayHandler(BaseHTTPRequestHandler):
                 "/api/reseller/orders": {
                     "get": {
                         "tags": ["Reseller API"], "summary": "List your orders", "operationId": "listOrders",
-                        "security": [{"bearerAuth": []}],
+                        "security": [{"Test API Key": []}],
                         "responses": {"200": {**success, "content": {"application/json": {"schema": {"$ref": "#/components/schemas/OrdersResponse"}}}}},
                     }
                 },
                 "/api/reseller/orders/{order_id}": {
                     "get": {
                         "tags": ["Reseller API"], "summary": "Get one order", "operationId": "getOrder",
-                        "security": [{"bearerAuth": []}],
+                        "security": [{"Test API Key": []}],
                         "parameters": [{"name": "order_id", "in": "path", "required": True, "schema": {"type": "integer", "minimum": 1}, "example": 123}],
                         "responses": {"200": {**success, "content": {"application/json": {"schema": {"$ref": "#/components/schemas/OrderResponse"}}}}, "404": {"description": "Order not found", "content": {"application/json": {"schema": error}}}},
                     }
                 },
             },
             "components": {
-                "securitySchemes": {"bearerAuth": {"type": "http", "scheme": "bearer", "bearerFormat": "AK_your_api_key", "description": "Paste your Telegram-generated API key."}},
+                "securitySchemes": {"Test API Key": {"type": "http", "scheme": "bearer", "bearerFormat": "AK_your_api_key", "description": "Paste an AK_... key generated from the ZDeals Bot Telegram menu. This key is used only for requests you make from this documentation page."}},
                 "schemas": {
                     "Product": {"type": "object", "properties": {"service_id": {"type": "string", "example": "330001"}, "name": {"type": "string", "example": "Test Product"}, "description": {"type": "string"}, "category": {"type": "string", "example": "streaming"}, "price": {"type": "string", "example": "0.50"}, "currency": {"type": "string", "example": "USDT"}, "stock": {"type": "integer", "example": 10}, "preorder": {"type": "boolean", "example": False}, "delivery_type": {"type": "string", "enum": ["automatic", "manual", "hybrid"]}}},
                     "ProductsResponse": {"type": "object", "properties": {"success": {"type": "boolean", "example": True}, "services": {"type": "array", "items": {"$ref": "#/components/schemas/Product"}}}},
