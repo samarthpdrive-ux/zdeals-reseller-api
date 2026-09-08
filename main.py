@@ -13,6 +13,7 @@ import logging
 import os
 import re
 import socket
+import ssl
 import threading
 import time
 from dataclasses import dataclass
@@ -25,6 +26,10 @@ from urllib.parse import parse_qs, urlsplit
 
 BOT_INTERNAL_URL = os.environ.get("BOT_INTERNAL_URL", "").strip().rstrip("/")
 BOT_INTERNAL_SECRET = os.environ.get("BOT_INTERNAL_SECRET", "").strip()
+BACKEND_CA_FILE = os.environ.get(
+    "BACKEND_CA_FILE",
+    os.path.join(os.path.dirname(os.path.abspath(__file__)), "ca.pem"),
+)
 HOST = os.environ.get("HOST", "0.0.0.0")
 PORT = int(os.environ.get("PORT", "80"))
 MAX_BODY_BYTES = 64 * 1024
@@ -45,6 +50,14 @@ def json_bytes(data: Any) -> bytes:
 
 def configured() -> bool:
     return bool(BOT_INTERNAL_URL and BOT_INTERNAL_SECRET)
+
+
+def build_backend_ssl_context() -> ssl.SSLContext:
+    """Use a bundled public CA root if the Wasmer runtime has no CA store."""
+    return ssl.create_default_context(cafile=BACKEND_CA_FILE)
+
+
+BACKEND_SSL_CONTEXT = build_backend_ssl_context()
 
 
 def backend_url(path: str, query: str = "") -> str:
@@ -137,12 +150,15 @@ class BackendConnectionPool:
             port = parsed.port or (443 if parsed.scheme == "https" else 80)
         except ValueError as error:
             raise OSError("Backend port is invalid.") from error
-        connection_class = (
-            http.client.HTTPSConnection
-            if parsed.scheme == "https"
-            else http.client.HTTPConnection
-        )
-        return connection_class(
+        if parsed.scheme == "https":
+            return http.client.HTTPSConnection(
+                parsed.hostname,
+                port=port,
+                timeout=BACKEND_TIMEOUT[0],
+                context=BACKEND_SSL_CONTEXT,
+            )
+
+        return http.client.HTTPConnection(
             parsed.hostname,
             port=port,
             timeout=BACKEND_TIMEOUT[0],
