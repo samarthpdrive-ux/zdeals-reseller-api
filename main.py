@@ -53,8 +53,18 @@ def configured() -> bool:
 
 
 def build_backend_ssl_context() -> ssl.SSLContext:
-    """Use a bundled public CA root if the Wasmer runtime has no CA store."""
-    return ssl.create_default_context(cafile=BACKEND_CA_FILE)
+    """Use a complete bundled CA store when the Wasmer image has none.
+
+    Python's pip distribution includes certifi's Mozilla CA bundle.  This avoids
+    trusting a single guessed CA and keeps hostname/certificate verification on.
+    The local X1/X2 file remains a safe fallback for minimal Python runtimes.
+    """
+    try:
+        from pip._vendor import certifi
+
+        return ssl.create_default_context(cafile=certifi.where())
+    except (ImportError, AttributeError, OSError):
+        return ssl.create_default_context(cafile=BACKEND_CA_FILE)
 
 
 BACKEND_SSL_CONTEXT = build_backend_ssl_context()
