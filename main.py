@@ -1,321 +1,192 @@
+"""ZDeals Bot Wasmer Reseller API Gateway.
 
-"""
-ZDeals Bot - Wasmer Reseller API Gateway
-
-PUBLIC:
-    /api/v1/me
-    /api/v1/products
-    /api/v1/order
-    /api/v1/orders
-    /api/v1/order/{order_id}
-
-COMPATIBILITY:
-    /api/reseller?action=products
-    /api/reseller?action=balance
-    /api/reseller?action=orders
-    /api/reseller?action=order
-
-The Wasmer gateway does NOT access the database directly.
-
-Architecture:
-
-    Client
-       |
-       | HTTPS
-       v
-    Wasmer
-       |
-       | X-API-Key
-       | X-Internal-Bot-Secret
-       v
-    Render FastAPI
-       |
-       v
-    Database / Telegram / Delivery
-
-Environment variables required on Wasmer:
-
-    BOT_INTERNAL_URL
-    BOT_INTERNAL_SECRET
-
-Example:
-
-    BOT_INTERNAL_URL=https://your-render-app.onrender.com
-    BOT_INTERNAL_SECRET=your_internal_secret
-
-IMPORTANT:
-    Never put BOT_INTERNAL_SECRET in client code.
+This service is the public API boundary.  It proxies authenticated requests to
+the configured delivery backend without exposing its address or credentials.
 """
 
 from __future__ import annotations
 
+import hashlib
 import json
+import logging
 import os
 import re
-import urllib.error
-import urllib.request
-
+import threading
+import time
+from dataclasses import dataclass
 from http import HTTPStatus
 from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
+from typing import Any
 from urllib.parse import parse_qs, urlsplit
 
+import requests
+from requests.adapters import HTTPAdapter
 
-# ============================================================
-# CONFIGURATION
-# ============================================================
 
-BOT_INTERNAL_URL = (
-    os.environ.get(
-        "BOT_INTERNAL_URL",
-        "",
-    )
-    .strip()
-    .rstrip("/")
-)
-
-BOT_INTERNAL_SECRET = (
-    os.environ.get(
-        "BOT_INTERNAL_SECRET",
-        "",
-    )
-    .strip()
-)
-
-HOST = os.environ.get(
-    "HOST",
-    "0.0.0.0",
-)
-
-PORT = int(
-    os.environ.get(
-        "PORT",
-        "80",
-    )
-)
-
+BOT_INTERNAL_URL = os.environ.get("BOT_INTERNAL_URL", "").strip().rstrip("/")
+BOT_INTERNAL_SECRET = os.environ.get("BOT_INTERNAL_SECRET", "").strip()
+HOST = os.environ.get("HOST", "0.0.0.0")
+PORT = int(os.environ.get("PORT", "80"))
 MAX_BODY_BYTES = 64 * 1024
+BACKEND_TIMEOUT = (3.0, 8.0)  # connect, read
+PRODUCT_CACHE_TTL = 30.0
+
+PUBLIC_V1_ORDER_PATH = re.compile(r"^/api/v1/order/[1-9][0-9]*$")
+PUBLIC_ORDER_PATH = re.compile(r"^/api/reseller/orders/([1-9][0-9]*)$")
+LOG = logging.getLogger("zdeals.gateway")
 
 
-# ============================================================
-# ROUTES
-# ============================================================
-
-PUBLIC_V1_ORDER_PATH = re.compile(
-    r"^/api/v1/order/[1-9][0-9]*$"
-)
-
-PUBLIC_ORDER_PATH = re.compile(
-    r"^/api/reseller/orders/([1-9][0-9]*)$"
-)
+def json_bytes(data: Any) -> bytes:
+    return json.dumps(data, separators=(",", ":"), ensure_ascii=False).encode("utf-8")
 
 
 def configured() -> bool:
-    return bool(
-        BOT_INTERNAL_URL
-        and BOT_INTERNAL_SECRET
-    )
+    return bool(BOT_INTERNAL_URL and BOT_INTERNAL_SECRET)
 
 
-def json_bytes(data: dict) -> bytes:
-    return json.dumps(
-        data,
-        separators=(",", ":"),
-        ensure_ascii=False,
-    ).encode("utf-8")
+def backend_url(path: str, query: str = "") -> str:
+    """Build a backend URL from a fixed, application-owned route."""
+    if not path.startswith("/"):
+        raise ValueError("Backend path must start with '/'.")
+    return f"{BOT_INTERNAL_URL}{path}" + (f"?{query}" if query else "")
 
 
-# ============================================================
-# HANDLER
-# ============================================================
+def safe_content_type(value: str | None) -> str:
+    """Do not reflect arbitrary/internal upstream headers to public clients."""
+    if value and value.lower().split(";", 1)[0].strip() in {
+        "application/json",
+        "application/problem+json",
+        "text/plain",
+    }:
+        return value
+    return "application/json; charset=utf-8"
 
-class GatewayHandler(
-    BaseHTTPRequestHandler
-):
 
-    server_version = (
-        "ZDealsBotResellerAPI/2.0"
-    )
+def contains_internal_data(body: bytes) -> bool:
+    """Fail closed if an upstream error accidentally includes private values."""
+    sensitive = (BOT_INTERNAL_URL, BOT_INTERNAL_SECRET)
+    return any(value and value.encode("utf-8") in body for value in sensitive)
 
-    # --------------------------------------------------------
-    # Logging
-    # --------------------------------------------------------
 
-    def log_message(
-        self,
-        format: str,
-        *args: object,
-    ) -> None:
+@dataclass(frozen=True)
+class CachedProducts:
+    expires_at: float
+    body: bytes
+    content_type: str
 
-        # Never log Authorization,
-        # API keys, or request bodies.
 
-        print(
-            "gateway",
-            self.command,
-            self.path.split("?", 1)[0],
-            args[1] if len(args) > 1 else "",
-        )
+class ProductCache:
+    """Short, per-reseller cache.  Keys are hashes so API keys are not retained."""
 
-    # --------------------------------------------------------
-    # Response
-    # --------------------------------------------------------
+    def __init__(self) -> None:
+        self._entries: dict[str, CachedProducts] = {}
+        self._lock = threading.Lock()
 
-    def send_json(
-        self,
-        status: int,
-        data: dict,
-    ) -> None:
+    @staticmethod
+    def key(api_key: str) -> str:
+        return hashlib.sha256(api_key.encode("utf-8")).hexdigest()
 
+    def get(self, api_key: str) -> CachedProducts | None:
+        now = time.monotonic()
+        key = self.key(api_key)
+        with self._lock:
+            entry = self._entries.get(key)
+            if entry and entry.expires_at > now:
+                return entry
+            self._entries.pop(key, None)
+        return None
+
+    def put(self, api_key: str, body: bytes, content_type: str) -> None:
+        entry = CachedProducts(time.monotonic() + PRODUCT_CACHE_TTL, body, content_type)
+        with self._lock:
+            self._entries[self.key(api_key)] = entry
+
+
+PRODUCT_CACHE = ProductCache()
+
+
+def build_backend_session() -> requests.Session:
+    """One process-wide pool for persistent Wasmer-to-Render connections."""
+    session = requests.Session()
+    adapter = HTTPAdapter(pool_connections=10, pool_maxsize=20, max_retries=0)
+    session.mount("https://", adapter)
+    session.mount("http://", adapter)
+    session.trust_env = False
+    return session
+
+
+BACKEND_SESSION = build_backend_session()
+
+
+class GatewayHandler(BaseHTTPRequestHandler):
+    server_version = "ZDealsBotResellerAPI/2.1"
+    protocol_version = "HTTP/1.1"
+
+    def log_message(self, _format: str, *_args: object) -> None:
+        # BaseHTTPRequestHandler can include arbitrary request text in its log.
+        # We log only the request method/path and never headers or bodies.
+        return
+
+    def send_bytes(self, status: int, body: bytes, content_type: str = "application/json; charset=utf-8") -> None:
         self.send_response(status)
-
-        self.send_header(
-            "Content-Type",
-            "application/json; charset=utf-8",
-        )
-
-        body = json_bytes(data)
-
-        self.send_header(
-            "Content-Length",
-            str(len(body)),
-        )
-
-        self.send_header(
-            "Cache-Control",
-            "no-store",
-        )
-
-        self.send_header(
-            "X-Content-Type-Options",
-            "nosniff",
-        )
-
-        self.send_header(
-            "Referrer-Policy",
-            "no-referrer",
-        )
-
+        self.send_header("Content-Type", safe_content_type(content_type))
+        self.send_header("Content-Length", str(len(body)))
+        self.send_header("Cache-Control", "no-store")
+        self.send_header("X-Content-Type-Options", "nosniff")
+        self.send_header("Referrer-Policy", "no-referrer")
         self.end_headers()
-
         self.wfile.write(body)
 
-    # --------------------------------------------------------
-    # Error
-    # --------------------------------------------------------
+    def send_json(self, status: int, data: dict[str, Any]) -> None:
+        self.send_bytes(status, json_bytes(data))
 
-    def error(
-        self,
-        status: int,
-        code: str,
-        message: str,
-    ) -> None:
+    def error(self, status: int, code: str, message: str) -> None:
+        self.send_json(status, {"success": False, "error": code, "message": message})
 
-        self.send_json(
+    def unavailable(self, status: int = 502) -> None:
+        self.error(
             status,
-            {
-                "success": False,
-                "error": code,
-                "message": message,
-            },
+            "delivery_service_unavailable",
+            "The delivery service is temporarily unavailable.",
         )
-
-    # ========================================================
-    # AUTHENTICATION
-    # ========================================================
 
     def get_api_key(self) -> str:
-
-        # Preferred:
-        #
-        # Authorization: Bearer AK_xxxxx
-        #
-
-        authorization = (
-            self.headers
-            .get("Authorization", "")
-            .strip()
-        )
-
+        """Accept current Bearer usage and the gateway's documented legacy forms."""
+        authorization = self.headers.get("Authorization", "").strip()
         if authorization:
-
-            if authorization.lower().startswith(
-                "bearer "
-            ):
-
+            if authorization.lower().startswith("bearer "):
                 return authorization[7:].strip()
+            return authorization  # legacy Authorization: AK_xxx compatibility
+        return self.headers.get("X-API-Key", "").strip()
 
-            # Also accept:
-            #
-            # Authorization: AK_xxxxx
-            #
-
-            return authorization
-
-        # Compatibility:
-        #
-        # X-API-Key: AK_xxxxx
-        #
-
-        return (
-            self.headers
-            .get("X-API-Key", "")
-            .strip()
-        )
-
-    # ========================================================
-    # BODY
-    # ========================================================
+    def require_api_key(self) -> str | None:
+        api_key = self.get_api_key()
+        if not api_key:
+            self.error(401, "missing_api_key", "Provide an API key using Authorization: Bearer <API_KEY>.")
+            return None
+        return api_key
 
     def read_body(self) -> bytes | None:
-
-        raw_length = self.headers.get(
-            "Content-Length",
-            "0",
-        )
-
         try:
-
-            length = int(
-                raw_length
-            )
-
+            length = int(self.headers.get("Content-Length", "0"))
         except ValueError:
-
-            self.error(
-                400,
-                "invalid_content_length",
-                "Invalid request body length.",
-            )
-
+            self.error(400, "invalid_content_length", "Invalid request body length.")
             return None
-
         if length < 0:
-
-            self.error(
-                400,
-                "invalid_content_length",
-                "Invalid request body length.",
-            )
-
+            self.error(400, "invalid_content_length", "Invalid request body length.")
             return None
-
         if length > MAX_BODY_BYTES:
-
-            self.error(
-                413,
-                "request_too_large",
-                "Request body is too large.",
-            )
-
+            self.error(413, "request_too_large", "Request body is too large.")
             return None
+        return self.rfile.read(length)
 
-        return self.rfile.read(
-            length
-        )
-
-    # ========================================================
-    # FORWARD TO RENDER
-    # ========================================================
+    def send_backend_response(self, response: requests.Response) -> None:
+        # Never turn an upstream redirect into a public redirect.  In particular,
+        # Location is intentionally not copied from the upstream response.
+        if 300 <= response.status_code < 400 or contains_internal_data(response.content):
+            self.unavailable()
+            return
+        self.send_bytes(response.status_code, response.content, response.headers.get("Content-Type"))
 
     def forward(
         self,
@@ -324,1483 +195,228 @@ class GatewayHandler(
         api_key: str,
         body: bytes | None = None,
         query: str = "",
+        cache_products: bool = False,
     ) -> None:
-
         if not configured():
-
-            self.error(
-                503,
-                "gateway_not_configured",
-                (
-                    "Wasmer gateway is not configured. "
-                    "Set BOT_INTERNAL_URL and "
-                    "BOT_INTERNAL_SECRET."
-                ),
-            )
-
+            self.unavailable(503)
             return
 
-        target = (
-            BOT_INTERNAL_URL
-            + internal_path
-        )
-
-        if query:
-
-            target += "?" + query
+        if cache_products and not query:
+            cached = PRODUCT_CACHE.get(api_key)
+            if cached:
+                self.send_bytes(200, cached.body, cached.content_type)
+                LOG.info("[PROXY] %s %s -> 200 in 0.00s (cache)", method, internal_path)
+                return
 
         headers = {
-            "Accept": (
-                "application/json"
-            ),
-
+            "Accept": "application/json",
             "X-API-Key": api_key,
-
-            "X-Internal-Bot-Secret":
-                BOT_INTERNAL_SECRET,
+            "X-Internal-Bot-Secret": BOT_INTERNAL_SECRET,
         }
-
         if body is not None:
+            headers["Content-Type"] = "application/json"
 
-            headers[
-                "Content-Type"
-            ] = "application/json"
-
-        request = urllib.request.Request(
-            target,
-            data=body,
-            headers=headers,
-            method=method,
-        )
-
+        started = time.monotonic()
         try:
-
-            with urllib.request.urlopen(
-                request,
-                timeout=30,
-            ) as response:
-
-                response_body = (
-                    response.read()
-                )
-
-                content_type = (
-                    response.headers.get(
-                        "Content-Type",
-                        "application/json; charset=utf-8",
-                    )
-                )
-
-                self.send_response(
-                    response.status
-                )
-
-                self.send_header(
-                    "Content-Type",
-                    content_type,
-                )
-
-                self.send_header(
-                    "Content-Length",
-                    str(len(response_body)),
-                )
-
-                self.send_header(
-                    "Cache-Control",
-                    "no-store",
-                )
-
-                self.end_headers()
-
-                self.wfile.write(
-                    response_body
-                )
-
-        except urllib.error.HTTPError as error:
-
-            try:
-
-                response_body = (
-                    error.read()
-                )
-
-            except Exception:
-
-                response_body = b""
-
-            if not response_body:
-
-                response_body = json_bytes(
-                    {
-                        "success": False,
-                        "error": "bot_error",
-                        "message": (
-                            "The backend returned "
-                            "an HTTP error."
-                        ),
-                    }
-                )
-
-            self.send_response(
-                error.code
+            response = BACKEND_SESSION.request(
+                method=method,
+                url=backend_url(internal_path, query),
+                data=body,
+                headers=headers,
+                timeout=BACKEND_TIMEOUT,
+                allow_redirects=False,
             )
+        except requests.RequestException:
+            elapsed = time.monotonic() - started
+            LOG.warning("[PROXY] %s %s -> unavailable in %.2fs", method, internal_path, elapsed)
+            self.unavailable()
+            return
 
-            self.send_header(
-                "Content-Type",
-                "application/json; charset=utf-8",
-            )
+        elapsed = time.monotonic() - started
+        LOG.info("[PROXY] %s %s -> %s in %.2fs", method, internal_path, response.status_code, elapsed)
+        if cache_products and not query and response.status_code == 200 and not contains_internal_data(response.content):
+            PRODUCT_CACHE.put(api_key, response.content, safe_content_type(response.headers.get("Content-Type")))
+        self.send_backend_response(response)
 
-            self.send_header(
-                "Content-Length",
-                str(len(response_body)),
-            )
+    def validated_order_body(self, body: bytes) -> bytes | None:
+        """Retain existing v1 validation while passing modern order JSON unchanged."""
+        try:
+            data = json.loads(body.decode("utf-8"))
+        except (UnicodeDecodeError, json.JSONDecodeError):
+            self.error(400, "invalid_json", "Request body must contain valid JSON.")
+            return None
+        if not isinstance(data, dict):
+            self.error(400, "invalid_order", "Request body must be a JSON object.")
+            return None
 
-            self.end_headers()
+        service_id = data.get("service_id", data.get("product_id"))
+        client_order_id = data.get("client_order_id", data.get("external_order_id"))
+        quantity = data.get("quantity", 1)
+        delivery_telegram_id = data.get("delivery_telegram_id")
+        try:
+            service_id = int(service_id)
+            quantity = int(quantity)
+            if delivery_telegram_id is not None:
+                delivery_telegram_id = int(delivery_telegram_id)
+        except (TypeError, ValueError):
+            self.error(400, "invalid_order", "service_id/product_id and quantity must be integers.")
+            return None
+        if service_id <= 0 or quantity <= 0:
+            self.error(400, "invalid_order", "service_id and quantity must be greater than zero.")
+            return None
+        if not client_order_id:
+            self.error(400, "invalid_order", "client_order_id or external_order_id is required.")
+            return None
+        if len(str(client_order_id)) > 80:
+            self.error(400, "invalid_order", "client_order_id is too long.")
+            return None
+        if delivery_telegram_id is not None and delivery_telegram_id <= 0:
+            self.error(400, "invalid_order", "delivery_telegram_id must be greater than zero.")
+            return None
 
-            self.wfile.write(
-                response_body
-            )
+        # Modern requests retain their exact bytes.  For documented legacy field
+        # names, add the canonical field names expected by the Render API while
+        # preserving the supplied values and all extra fields.
+        if "service_id" in data and "client_order_id" in data:
+            return body
+        normalized = dict(data)
+        normalized.setdefault("service_id", service_id)
+        normalized.setdefault("client_order_id", str(client_order_id))
+        normalized.setdefault("quantity", quantity)
+        if delivery_telegram_id is not None:
+            normalized["delivery_telegram_id"] = delivery_telegram_id
+        return json_bytes(normalized)
 
-        except (
-            urllib.error.URLError,
-            TimeoutError,
-            OSError,
-        ) as error:
-
-            print(
-                "Backend connection error:",
-                repr(error),
-            )
-
-            self.error(
-                502,
-                "delivery_service_unavailable",
-                (
-                    "The Render delivery service "
-                    "could not be reached."
-                ),
-            )
-
-    # ========================================================
-    # PUBLIC V1 ROUTING
-    # ========================================================
-
-    def handle_v1(
-        self,
-        method: str,
-    ) -> None:
-
-        parsed = urlsplit(
-            self.path
-        )
-
+    def handle_v1(self, method: str) -> None:
+        parsed = urlsplit(self.path)
         path = parsed.path
-
-        # ----------------------------------------------------
-        # Allowed GET
-        # ----------------------------------------------------
-
+        api_key = self.require_api_key()
+        if api_key is None:
+            return
         if method == "GET":
-
             if path == "/api/v1/products":
-
-                self.forward(
-                    "GET",
-                    "/api/v1/products",
-                    self.get_api_key(),
-                    query=parsed.query,
-                )
-
+                self.forward("GET", path, api_key, query=parsed.query, cache_products=True)
                 return
-
-            if path == "/api/v1/me":
-
-                self.forward(
-                    "GET",
-                    "/api/v1/me",
-                    self.get_api_key(),
-                    query=parsed.query,
-                )
-
+            if path in {"/api/v1/me", "/api/v1/orders"}:
+                self.forward("GET", path, api_key, query=parsed.query)
                 return
-
-            if path == "/api/v1/orders":
-
-                self.forward(
-                    "GET",
-                    "/api/v1/orders",
-                    self.get_api_key(),
-                    query=parsed.query,
-                )
-
+            if PUBLIC_V1_ORDER_PATH.fullmatch(path):
+                self.forward("GET", path, api_key, query=parsed.query)
                 return
-
-            match = (
-                PUBLIC_V1_ORDER_PATH.fullmatch(
-                    path
-                )
-            )
-
-            if match:
-
-                order_id = match.group(
-                    0
-                ).rsplit(
-                    "/",
-                    1,
-                )[-1]
-
-                self.forward(
-                    "GET",
-                    f"/api/v1/order/{order_id}",
-                    self.get_api_key(),
-                    query=parsed.query,
-                )
-
-                return
-
-            self.error(
-                404,
-                "not_found",
-                "Endpoint not found.",
-            )
-
-            return
-
-        # ----------------------------------------------------
-        # POST ORDER
-        # ----------------------------------------------------
-
-        if method == "POST" and path == "/api/v1/order":
-
-            api_key = self.get_api_key()
-
-            if not api_key:
-
-                self.error(
-                    401,
-                    "missing_api_key",
-                    (
-                        "Provide your API key using "
-                        "Authorization: Bearer <API_KEY>."
-                    ),
-                )
-
-                return
-
+        elif method == "POST" and path == "/api/v1/order":
             body = self.read_body()
-
-            if body is None:
-
-                return
-
-            try:
-
-                data = json.loads(
-                    body.decode("utf-8")
-                )
-
-            except (
-                UnicodeDecodeError,
-                json.JSONDecodeError,
-            ):
-
-                self.error(
-                    400,
-                    "invalid_json",
-                    "Request body must contain valid JSON.",
-                )
-
-                return
-
-            # ------------------------------------------------
-            # Accept BOTH naming conventions
-            #
-            # New:
-            #
-            # service_id
-            # client_order_id
-            #
-            # Old:
-            #
-            # product_id
-            # external_order_id
-            # ------------------------------------------------
-
-            service_id = data.get(
-                "service_id"
-            )
-
-            if service_id is None:
-
-                service_id = data.get(
-                    "product_id"
-                )
-
-            client_order_id = data.get(
-                "client_order_id"
-            )
-
-            if client_order_id is None:
-
-                client_order_id = data.get(
-                    "external_order_id"
-                )
-
-            quantity = data.get(
-                "quantity",
-                1,
-            )
-
-            delivery_telegram_id = data.get(
-                "delivery_telegram_id"
-            )
-
-            try:
-
-                service_id = int(
-                    service_id
-                )
-
-                quantity = int(
-                    quantity
-                )
-
-                if delivery_telegram_id is not None:
-
-                    delivery_telegram_id = int(
-                        delivery_telegram_id
-                    )
-
-            except (
-                TypeError,
-                ValueError,
-            ):
-
-                self.error(
-                    400,
-                    "invalid_order",
-                    (
-                        "service_id/product_id and "
-                        "quantity must be integers."
-                    ),
-                )
-
-                return
-
-            if service_id <= 0:
-
-                self.error(
-                    400,
-                    "invalid_order",
-                    "service_id must be greater than zero.",
-                )
-
-                return
-
-            if quantity <= 0:
-
-                self.error(
-                    400,
-                    "invalid_order",
-                    "quantity must be greater than zero.",
-                )
-
-                return
-
-            if not client_order_id:
-
-                self.error(
-                    400,
-                    "invalid_order",
-                    (
-                        "client_order_id or "
-                        "external_order_id is required."
-                    ),
-                )
-
-                return
-
-            client_order_id = str(
-                client_order_id
-            )
-
-            if len(
-                client_order_id
-            ) > 80:
-
-                self.error(
-                    400,
-                    "invalid_order",
-                    "client_order_id is too long.",
-                )
-
-                return
-
-            if delivery_telegram_id is not None:
-
-                if delivery_telegram_id <= 0:
-
-                    self.error(
-                        400,
-                        "invalid_order",
-                        (
-                            "delivery_telegram_id "
-                            "must be greater than zero."
-                        ),
-                    )
-
-                    return
-
-            bot_payload = json_bytes(
-                {
-                    "service_id": service_id,
-                    "quantity": quantity,
-                    "client_order_id": (
-                        client_order_id
-                    ),
-                    "delivery_telegram_id": (
-                        delivery_telegram_id
-                    ),
-                }
-            )
-
-            self.forward(
-                "POST",
-                "/api/v1/order",
-                api_key,
-                bot_payload,
-            )
-
+            if body is not None:
+                body = self.validated_order_body(body)
+            if body is not None:
+                self.forward("POST", path, api_key, body=body)
             return
+        self.error(404, "not_found", "Endpoint not found.")
 
-        self.error(
-            404,
-            "not_found",
-            "Endpoint not found.",
-        )
-
-    # ========================================================
-    # LEGACY /api/reseller COMPATIBILITY
-    # ========================================================
-
-    def handle_legacy(
-        self,
-        method: str,
-    ) -> None:
-
-        parsed = urlsplit(
-            self.path
-        )
-
-        api_key = self.get_api_key()
-
-        if not api_key:
-
-            self.error(
-                401,
-                "missing_api_key",
-                (
-                    "Provide your API key using "
-                    "Authorization: Bearer <API_KEY>."
-                ),
-            )
-
+    def handle_legacy(self, method: str) -> None:
+        parsed = urlsplit(self.path)
+        api_key = self.require_api_key()
+        if api_key is None:
             return
-
-        action = (
-            parse_qs(
-                parsed.query
-            )
-            .get(
-                "action",
-                [""],
-            )[0]
-            .lower()
-        )
-
-        # ----------------------------------------------------
-        # GET
-        # ----------------------------------------------------
-
+        action = parse_qs(parsed.query).get("action", [""])[0].lower()
         if method == "GET":
-
-            if action == "products":
-
-                self.forward(
-                    "GET",
-                    "/api/v1/products",
-                    api_key,
-                )
-
+            routes = {"products": "/api/v1/products", "balance": "/api/v1/me", "orders": "/api/v1/orders"}
+            if action in routes:
+                self.forward("GET", routes[action], api_key, cache_products=action == "products")
                 return
-
-            if action == "balance":
-
-                self.forward(
-                    "GET",
-                    "/api/v1/me",
-                    api_key,
-                )
-
-                return
-
-            if action == "orders":
-
-                self.forward(
-                    "GET",
-                    "/api/v1/orders",
-                    api_key,
-                )
-
-                return
-
             if action == "order":
-
-                self.error(
-                    400,
-                    "invalid_request",
-                    (
-                        "Use "
-                        "/api/reseller/orders/{order_id} "
-                        "for a single order."
-                    ),
-                )
-
+                self.error(400, "invalid_request", "Use /api/reseller/orders/{order_id} for a single order.")
                 return
-
-            self.error(
-                404,
-                "invalid_action",
-                (
-                    "Use action=products, "
-                    "balance, or orders."
-                ),
-            )
-
+            self.error(404, "invalid_action", "Use action=products, balance, or orders.")
             return
-
-        # ----------------------------------------------------
-        # POST ORDER
-        # ----------------------------------------------------
-
         if method == "POST" and action == "order":
-
-            # Redirect the old endpoint into
-            # the new order implementation.
-
             body = self.read_body()
-
-            if body is None:
-
-                return
-
-            try:
-
-                data = json.loads(
-                    body.decode("utf-8")
-                )
-
-            except (
-                UnicodeDecodeError,
-                json.JSONDecodeError,
-            ):
-
-                self.error(
-                    400,
-                    "invalid_json",
-                    "Request body must contain valid JSON.",
-                )
-
-                return
-
-            service_id = data.get(
-                "service_id"
-            )
-
-            if service_id is None:
-
-                service_id = data.get(
-                    "product_id"
-                )
-
-            client_order_id = data.get(
-                "client_order_id"
-            )
-
-            if client_order_id is None:
-
-                client_order_id = data.get(
-                    "external_order_id"
-                )
-
-            try:
-
-                service_id = int(
-                    service_id
-                )
-
-                quantity = int(
-                    data.get(
-                        "quantity",
-                        1,
-                    )
-                )
-
-            except (
-                TypeError,
-                ValueError,
-            ):
-
-                self.error(
-                    400,
-                    "invalid_order",
-                    (
-                        "Send product_id/service_id "
-                        "and quantity."
-                    ),
-                )
-
-                return
-
-            if not client_order_id:
-
-                self.error(
-                    400,
-                    "invalid_order",
-                    (
-                        "external_order_id or "
-                        "client_order_id is required."
-                    ),
-                )
-
-                return
-
-            delivery_telegram_id = (
-                data.get(
-                    "delivery_telegram_id"
-                )
-            )
-
-            if delivery_telegram_id is not None:
-
-                try:
-
-                    delivery_telegram_id = int(
-                        delivery_telegram_id
-                    )
-
-                except ValueError:
-
-                    self.error(
-                        400,
-                        "invalid_order",
-                        "Invalid delivery_telegram_id.",
-                    )
-
-                    return
-
-            bot_payload = json_bytes(
-                {
-                    "service_id": service_id,
-                    "quantity": quantity,
-                    "client_order_id": str(
-                        client_order_id
-                    ),
-                    "delivery_telegram_id": (
-                        delivery_telegram_id
-                    ),
-                }
-            )
-
-            self.forward(
-                "POST",
-                "/api/v1/order",
-                api_key,
-                bot_payload,
-            )
-
+            if body is not None:
+                body = self.validated_order_body(body)
+            if body is not None:
+                self.forward("POST", "/api/v1/order", api_key, body=body)
             return
-
-        self.error(
-            404,
-            "invalid_action",
-            "Invalid reseller action.",
-        )
-
-    # ========================================================
-    # GET
-    # ========================================================
+        self.error(404, "invalid_action", "Invalid reseller action.")
 
     def do_GET(self) -> None:
-
-        parsed = urlsplit(
-            self.path
-        )
-
+        parsed = urlsplit(self.path)
         path = parsed.path
-
-        # ----------------------------------------------------
-        # Health
-        # ----------------------------------------------------
-
         if path == "/health":
-
-            self.send_json(
-                200,
-                {
-                    "status": "ok",
-                    "service": (
-                        "ZDeals Bot Wasmer "
-                        "Reseller API"
-                    ),
-                    "version": "2.0",
-                },
-            )
-
-            return
-
-        # ----------------------------------------------------
-        # Root
-        # ----------------------------------------------------
-
-        if path == "/":
-
+            self.send_json(200, {"status": "ok", "service": "ZDeals Reseller API"})
+        elif path == "/":
             self.home()
-
-            return
-
-        # ----------------------------------------------------
-        # Docs
-        # ----------------------------------------------------
-
-        if path == "/docs":
-
+        elif path == "/docs":
             self.docs()
-
-            return
-
-        # ----------------------------------------------------
-        # OpenAPI
-        # ----------------------------------------------------
-
-        if path == "/openapi.json":
-
-            self.send_json(
-                200,
-                self.openapi_spec(),
-            )
-
-            return
-
-        # ----------------------------------------------------
-        # New API
-        # ----------------------------------------------------
-
-        if path.startswith(
-            "/api/v1/"
-        ):
-
-            self.handle_v1(
-                "GET"
-            )
-
-            return
-
-        # ----------------------------------------------------
-        # Legacy API
-        # ----------------------------------------------------
-
-        if path == "/api/reseller":
-
-            self.handle_legacy(
-                "GET"
-            )
-
-            return
-
-        if path in {
-            "/api/reseller/products",
-            "/api/reseller/balance",
-            "/api/reseller/orders",
-        }:
-
-            action = {
-                "/api/reseller/products":
-                    "products",
-
-                "/api/reseller/balance":
-                    "balance",
-
-                "/api/reseller/orders":
-                    "orders",
-            }[path]
-
-            fake_query = (
-                f"/api/reseller"
-                f"?action={action}"
-            )
-
+        elif path == "/openapi.json":
+            self.send_json(200, self.openapi_spec())
+        elif path.startswith("/api/v1/"):
+            self.handle_v1("GET")
+        elif path == "/api/reseller":
+            self.handle_legacy("GET")
+        elif path in {"/api/reseller/products", "/api/reseller/balance", "/api/reseller/orders"}:
+            action = {"/api/reseller/products": "products", "/api/reseller/balance": "balance", "/api/reseller/orders": "orders"}[path]
             original = self.path
-
-            self.path = fake_query
-
+            self.path = f"/api/reseller?action={action}"
             try:
-
-                self.handle_legacy(
-                    "GET"
-                )
-
+                self.handle_legacy("GET")
             finally:
-
                 self.path = original
-
-            return
-
-        match = PUBLIC_ORDER_PATH.fullmatch(
-            path
-        )
-
-        if match:
-
-            order_id = match.group(
-                1
-            )
-
-            self.forward(
-                "GET",
-                f"/api/v1/order/{order_id}",
-                self.get_api_key(),
-                query=parsed.query,
-            )
-
-            return
-
-        self.error(
-            404,
-            "not_found",
-            "Endpoint not found.",
-        )
-
-    # ========================================================
-    # POST
-    # ========================================================
+        elif match := PUBLIC_ORDER_PATH.fullmatch(path):
+            api_key = self.require_api_key()
+            if api_key is not None:
+                self.forward("GET", f"/api/v1/order/{match.group(1)}", api_key, query=parsed.query)
+        else:
+            self.error(404, "not_found", "Endpoint not found.")
 
     def do_POST(self) -> None:
-
-        parsed = urlsplit(
-            self.path
-        )
-
-        path = parsed.path
-
+        path = urlsplit(self.path).path
         if path == "/api/v1/order":
-
-            self.handle_v1(
-                "POST"
-            )
-
-            return
-
-        if path == "/api/reseller":
-
-            self.handle_legacy(
-                "POST"
-            )
-
-            return
-
-        if path == "/api/reseller/order":
-
-            self.handle_legacy(
-                "POST"
-            )
-
-            return
-
-        self.error(
-            404,
-            "not_found",
-            "Endpoint not found.",
-        )
-
-    # ========================================================
-    # OPTIONS
-    # ========================================================
+            self.handle_v1("POST")
+        elif path in {"/api/reseller", "/api/reseller/order"}:
+            self.handle_legacy("POST")
+        else:
+            self.error(404, "not_found", "Endpoint not found.")
 
     def do_OPTIONS(self) -> None:
-
-        self.send_response(
-            HTTPStatus.NO_CONTENT
-        )
-
-        self.send_header(
-            "Access-Control-Allow-Origin",
-            "*",
-        )
-
-        self.send_header(
-            "Access-Control-Allow-Methods",
-            "GET, POST, OPTIONS",
-        )
-
-        self.send_header(
-            "Access-Control-Allow-Headers",
-            (
-                "Authorization, "
-                "Content-Type, "
-                "X-API-Key"
-            ),
-        )
-
-        self.send_header(
-            "Access-Control-Max-Age",
-            "600",
-        )
-
+        self.send_response(HTTPStatus.NO_CONTENT)
+        self.send_header("Access-Control-Allow-Origin", "*")
+        self.send_header("Access-Control-Allow-Methods", "GET, POST, OPTIONS")
+        self.send_header("Access-Control-Allow-Headers", "Authorization, Content-Type, X-API-Key")
+        self.send_header("Access-Control-Max-Age", "600")
+        self.send_header("Content-Length", "0")
         self.end_headers()
-
-    # ========================================================
-    # HOME
-    # ========================================================
 
     def home(self) -> None:
-
-        page = """
-<!doctype html>
-<html>
-<head>
-<meta charset="utf-8">
-<title>ZDeals Bot Developer API</title>
-<meta name="viewport"
-      content="width=device-width, initial-scale=1">
-<style>
-body {
-    font-family: Arial, sans-serif;
-    max-width: 900px;
-    margin: 50px auto;
-    padding: 20px;
-    line-height: 1.6;
-}
-code {
-    background: #f1f1f1;
-    padding: 3px 6px;
-    border-radius: 4px;
-}
-</style>
-</head>
-<body>
-
-<h1>ZDeals Bot Developer API</h1>
-
-<p>
-Wasmer public reseller API gateway.
-</p>
-
-<h2>API</h2>
-
-<ul>
-<li><code>GET /health</code></li>
-<li><code>GET /api/v1/me</code></li>
-<li><code>GET /api/v1/products</code></li>
-<li><code>GET /api/v1/orders</code></li>
-<li><code>GET /api/v1/order/{order_id}</code></li>
-<li><code>POST /api/v1/order</code></li>
-</ul>
-
-<p>
-Open <a href="/docs">/docs</a>
-for interactive API documentation.
-</p>
-
-</body>
-</html>
-"""
-
-        self.send_response(
-            200
-        )
-
-        self.send_header(
-            "Content-Type",
-            "text/html; charset=utf-8",
-        )
-
-        body = page.encode(
-            "utf-8"
-        )
-
-        self.send_header(
-            "Content-Length",
-            str(len(body)),
-        )
-
-        self.end_headers()
-
-        self.wfile.write(
-            body
-        )
-
-    # ========================================================
-    # DOCS
-    # ========================================================
+        page = """<!doctype html><html><head><meta charset=\"utf-8\"><title>ZDeals Bot Developer API</title></head><body><h1>ZDeals Bot Developer API</h1><p>Wasmer public reseller API gateway.</p><ul><li>GET /health</li><li>GET /api/v1/me</li><li>GET /api/v1/products</li><li>GET /api/v1/orders</li><li>GET /api/v1/order/{order_id}</li><li>POST /api/v1/order</li></ul><p>Open <a href=\"/docs\">/docs</a> for interactive API documentation.</p></body></html>"""
+        self.send_bytes(200, page.encode("utf-8"), "text/html; charset=utf-8")
 
     def docs(self) -> None:
+        page = """<!doctype html><html><head><meta charset=\"utf-8\"><title>ZDeals Bot API</title><link rel=\"stylesheet\" href=\"https://unpkg.com/swagger-ui-dist@5/swagger-ui.css\"></head><body><div id=\"swagger-ui\"></div><script src=\"https://unpkg.com/swagger-ui-dist@5/swagger-ui-bundle.js\"></script><script>window.ui=SwaggerUIBundle({url:'/openapi.json',dom_id:'#swagger-ui',deepLinking:true,persistAuthorization:false,displayRequestDuration:true,tryItOutEnabled:true});</script></body></html>"""
+        self.send_bytes(200, page.encode("utf-8"), "text/html; charset=utf-8")
 
-        page = """
-<!doctype html>
-<html>
-<head>
-<meta charset="utf-8">
-<meta name="viewport"
-      content="width=device-width, initial-scale=1">
-
-<title>ZDeals Bot API</title>
-
-<link
-rel="stylesheet"
-href="https://unpkg.com/swagger-ui-dist@5/swagger-ui.css">
-</head>
-
-<body>
-
-<div id="swagger-ui"></div>
-
-<script src="https://unpkg.com/swagger-ui-dist@5/swagger-ui-bundle.js"></script>
-
-<script>
-window.ui = SwaggerUIBundle({
-    url: "/openapi.json",
-    dom_id: "#swagger-ui",
-    deepLinking: true,
-    persistAuthorization: false,
-    displayRequestDuration: true,
-    tryItOutEnabled: true
-});
-</script>
-
-</body>
-</html>
-"""
-
-        self.send_response(
-            200
-        )
-
-        self.send_header(
-            "Content-Type",
-            "text/html; charset=utf-8",
-        )
-
-        body = page.encode(
-            "utf-8"
-        )
-
-        self.send_header(
-            "Content-Length",
-            str(len(body)),
-        )
-
-        self.end_headers()
-
-        self.wfile.write(
-            body
-        )
-
-    # ========================================================
-    # OPENAPI
-    # ========================================================
-
-    def openapi_spec(self) -> dict:
-
+    def openapi_spec(self) -> dict[str, Any]:
+        bearer = [{"ApiKey": []}]
+        responses = {"401": {"description": "Invalid API key"}}
         return {
-
             "openapi": "3.0.3",
-
-            "info": {
-                "title":
-                    "ZDeals Bot Developer API",
-
-                "version":
-                    "2.0.0",
-
-                "description": (
-                    "ZDeals Bot reseller API. "
-                    "Use Authorization: Bearer "
-                    "YOUR_API_KEY."
-                ),
-            },
-
-            "servers": [
-                {
-                    "url": "/",
-                }
-            ],
-
-            "components": {
-
-                "securitySchemes": {
-
-                    "ApiKey": {
-
-                        "type":
-                            "http",
-
-                        "scheme":
-                            "bearer",
-
-                        "bearerFormat":
-                            "AK_xxxxxxxxx",
-                    }
-                },
-
-                "schemas": {
-
-                    "Error": {
-
-                        "type":
-                            "object",
-
-                        "properties": {
-
-                            "success": {
-                                "type":
-                                    "boolean"
-                            },
-
-                            "error": {
-                                "type":
-                                    "string"
-                            },
-
-                            "message": {
-                                "type":
-                                    "string"
-                            },
-                        },
-                    },
-
-                    "OrderRequest": {
-
-                        "type":
-                            "object",
-
-                        "required": [
-                            "service_id",
-                            "quantity",
-                            "client_order_id",
-                        ],
-
-                        "properties": {
-
-                            "service_id": {
-                                "type":
-                                    "integer",
-
-                                "example":
-                                    1,
-                            },
-
-                            "quantity": {
-                                "type":
-                                    "integer",
-
-                                "minimum":
-                                    1,
-
-                                "maximum":
-                                    100,
-
-                                "example":
-                                    1,
-                            },
-
-                            "client_order_id": {
-                                "type":
-                                    "string",
-
-                                "example":
-                                    "TEST-10001",
-                            },
-
-                            "delivery_telegram_id": {
-                                "type":
-                                    "integer",
-
-                                "nullable":
-                                    True,
-
-                                "example":
-                                    123456789,
-                            },
-                        },
-                    },
-                },
-            },
-
+            "info": {"title": "ZDeals Bot Developer API", "version": "2.1.0", "description": "Use Authorization: Bearer YOUR_API_KEY."},
+            "servers": [{"url": "/"}],
+            "components": {"securitySchemes": {"ApiKey": {"type": "http", "scheme": "bearer", "bearerFormat": "AK_xxxxxxxxx"}}},
             "paths": {
-
-                "/health": {
-
-                    "get": {
-
-                        "summary":
-                            "Health check",
-
-                        "responses": {
-
-                            "200": {
-                                "description":
-                                    "OK"
-                            }
-                        },
-                    }
-                },
-
-                "/api/v1/me": {
-
-                    "get": {
-
-                        "summary":
-                            "Get wallet/account",
-
-                        "security": [
-                            {
-                                "ApiKey": []
-                            }
-                        ],
-
-                        "responses": {
-
-                            "200": {
-                                "description":
-                                    "Account"
-                            },
-
-                            "401": {
-                                "description":
-                                    "Invalid API key"
-                            },
-                        },
-                    }
-                },
-
-                "/api/v1/products": {
-
-                    "get": {
-
-                        "summary":
-                            "List products",
-
-                        "security": [
-                            {
-                                "ApiKey": []
-                            }
-                        ],
-
-                        "responses": {
-
-                            "200": {
-                                "description":
-                                    "Products"
-                            },
-
-                            "401": {
-                                "description":
-                                    "Invalid API key"
-                            },
-                        },
-                    }
-                },
-
-                "/api/v1/orders": {
-
-                    "get": {
-
-                        "summary":
-                            "List orders",
-
-                        "security": [
-                            {
-                                "ApiKey": []
-                            }
-                        ],
-
-                        "responses": {
-
-                            "200": {
-                                "description":
-                                    "Orders"
-                            }
-                        },
-                    }
-                },
-
-                "/api/v1/order/{order_id}": {
-
-                    "get": {
-
-                        "summary":
-                            "Get order",
-
-                        "security": [
-                            {
-                                "ApiKey": []
-                            }
-                        ],
-
-                        "parameters": [
-
-                            {
-                                "name":
-                                    "order_id",
-
-                                "in":
-                                    "path",
-
-                                "required":
-                                    True,
-
-                                "schema": {
-                                    "type":
-                                        "integer"
-                                },
-                            }
-                        ],
-
-                        "responses": {
-
-                            "200": {
-                                "description":
-                                    "Order"
-                            },
-
-                            "404": {
-                                "description":
-                                    "Order not found"
-                            },
-                        },
-                    }
-                },
-
-                "/api/v1/order": {
-
-                    "post": {
-
-                        "summary":
-                            "Create order",
-
-                        "security": [
-                            {
-                                "ApiKey": []
-                            }
-                        ],
-
-                        "requestBody": {
-
-                            "required":
-                                True,
-
-                            "content": {
-
-                                "application/json": {
-
-                                    "schema": {
-                                        "$ref":
-                                            "#/components/schemas/OrderRequest"
-                                    }
-                                }
-                            },
-                        },
-
-                        "responses": {
-
-                            "200": {
-                                "description":
-                                    "Order created"
-                            },
-
-                            "400": {
-                                "description":
-                                    "Invalid order"
-                            },
-
-                            "401": {
-                                "description":
-                                    "Invalid API key"
-                            },
-
-                            "404": {
-                                "description":
-                                    "Product not found"
-                            },
-                        },
-                    }
-                },
+                "/health": {"get": {"summary": "Health check", "responses": {"200": {"description": "OK"}}}},
+                "/api/v1/me": {"get": {"summary": "Get wallet/account", "security": bearer, "responses": {"200": {"description": "Account"}, **responses}}},
+                "/api/v1/products": {"get": {"summary": "List products", "security": bearer, "responses": {"200": {"description": "Products"}, **responses}}},
+                "/api/v1/orders": {"get": {"summary": "List orders", "security": bearer, "responses": {"200": {"description": "Orders"}, **responses}}},
+                "/api/v1/order/{order_id}": {"get": {"summary": "Get order", "security": bearer, "parameters": [{"name": "order_id", "in": "path", "required": True, "schema": {"type": "integer"}}], "responses": {"200": {"description": "Order"}, "404": {"description": "Order not found"}, **responses}}},
+                "/api/v1/order": {"post": {"summary": "Create order", "security": bearer, "requestBody": {"required": True, "content": {"application/json": {"schema": {"type": "object"}}}}, "responses": {"200": {"description": "Order created"}, "400": {"description": "Invalid order"}, "404": {"description": "Product not found"}, **responses}}},
             },
         }
 
 
-# ============================================================
-# START
-# ============================================================
+class GatewayServer(ThreadingHTTPServer):
+    daemon_threads = True
+
 
 if __name__ == "__main__":
-
-    print(
-        "=================================================="
-    )
-
-    print(
-        "ZDeals Bot Wasmer Reseller API"
-    )
-
-    print(
-        "=================================================="
-    )
-
-    print(
-        f"Host: {HOST}"
-    )
-
-    print(
-        f"Port: {PORT}"
-    )
-
-    print(
-        "Backend configured:",
-        configured(),
-    )
-
-    if BOT_INTERNAL_URL:
-
-        print(
-            "Backend:",
-            BOT_INTERNAL_URL,
-        )
-
-    else:
-
-        print(
-            "WARNING: BOT_INTERNAL_URL is missing"
-        )
-
-    if not BOT_INTERNAL_SECRET:
-
-        print(
-            "WARNING: BOT_INTERNAL_SECRET is missing"
-        )
-
-    print(
-        "=================================================="
-    )
-
-    server = ThreadingHTTPServer(
-        (
-            HOST,
-            PORT,
-        ),
-        GatewayHandler,
-    )
-
-    server.serve_forever()
+    logging.basicConfig(level=os.environ.get("LOG_LEVEL", "INFO"), format="%(asctime)s %(levelname)s %(message)s")
+    LOG.info("ZDeals Bot Wasmer Reseller API starting on %s:%s; backend configured=%s", HOST, PORT, configured())
+    GatewayServer((HOST, PORT), GatewayHandler).serve_forever()
