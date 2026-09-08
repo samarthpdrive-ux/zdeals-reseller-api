@@ -33,10 +33,10 @@ BACKEND_CA_FILE = os.environ.get(
 HOST = os.environ.get("HOST", "0.0.0.0")
 PORT = int(os.environ.get("PORT", "80"))
 MAX_BODY_BYTES = 64 * 1024
-# The read budget is deliberately five seconds: combined with the three-second
-# connection budget, a non-streaming backend response cannot keep a client
-# waiting for the old 30-second default timeout.
-BACKEND_TIMEOUT = (3.0, 5.0)  # connect, read
+# Render's product response is currently about 6 seconds, so preserve valid
+# responses with the requested eight-second read budget (instead of failing at
+# five seconds).  There is still no 30/60-second hang.
+BACKEND_TIMEOUT = (3.0, 8.0)  # connect, read
 PRODUCT_CACHE_TTL = 30.0
 
 PUBLIC_V1_ORDER_PATH = re.compile(r"^/api/v1/order/[1-9][0-9]*$")
