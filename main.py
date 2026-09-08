@@ -29,8 +29,8 @@ HOST = os.environ.get("HOST", "0.0.0.0")
 PORT = int(os.environ.get("PORT", "80"))
 MAX_BODY_BYTES = 64 * 1024
 # The read budget is deliberately five seconds: combined with the three-second
-# connection budget, a non-streaming Render response cannot keep the client
-# waiting for the old 30-second urllib timeout.
+# connection budget, a non-streaming backend response cannot keep a client
+# waiting for the old 30-second default timeout.
 BACKEND_TIMEOUT = (3.0, 5.0)  # connect, read
 PRODUCT_CACHE_TTL = 30.0
 
@@ -133,13 +133,20 @@ class BackendConnectionPool:
         if parsed.path not in {"", "/"} or parsed.query or parsed.fragment:
             raise OSError("Backend base URL may not include a path or query.")
 
-        port = parsed.port or (443 if parsed.scheme == "https" else 80)
+        try:
+            port = parsed.port or (443 if parsed.scheme == "https" else 80)
+        except ValueError as error:
+            raise OSError("Backend port is invalid.") from error
         connection_class = (
             http.client.HTTPSConnection
             if parsed.scheme == "https"
             else http.client.HTTPConnection
         )
-        return connection_class(parsed.hostname, port=port, timeout=3.0)
+        return connection_class(
+            parsed.hostname,
+            port=port,
+            timeout=BACKEND_TIMEOUT[0],
+        )
 
     def _release(self, connection: http.client.HTTPConnection) -> None:
         try:
@@ -162,13 +169,13 @@ class BackendConnectionPool:
 
         try:
             if connection.sock is None:
-                connection.timeout = 3.0
+                connection.timeout = BACKEND_TIMEOUT[0]
 
             target = path + (f"?{query}" if query else "")
             connection.request(method, target, body=body, headers=headers)
 
             if connection.sock is not None:
-                connection.sock.settimeout(5.0)
+                connection.sock.settimeout(BACKEND_TIMEOUT[1])
 
             response = connection.getresponse()
             result = BackendResponse(
@@ -309,9 +316,15 @@ class GatewayHandler(BaseHTTPRequestHandler):
             LOG.warning("[PROXY] %s %s -> timeout in %.2fs", method, internal_path, elapsed)
             self.unavailable(504)
             return
-        except (OSError, http.client.HTTPException):
+        except (OSError, http.client.HTTPException) as error:
             elapsed = time.monotonic() - started
-            LOG.warning("[PROXY] %s %s -> unavailable in %.2fs", method, internal_path, elapsed)
+            LOG.warning(
+                "[PROXY] %s %s -> unavailable (%s) in %.2fs",
+                method,
+                internal_path,
+                type(error).__name__,
+                elapsed,
+            )
             self.unavailable(502)
             return
 
