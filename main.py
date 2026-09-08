@@ -334,11 +334,18 @@ class GatewayHandler(BaseHTTPRequestHandler):
             return
         except (OSError, http.client.HTTPException) as error:
             elapsed = time.monotonic() - started
+            tls_detail = ""
+            if isinstance(error, ssl.SSLCertVerificationError):
+                tls_detail = (
+                    f" verify_code={error.verify_code}"
+                    f" verify_message={error.verify_message!r}"
+                )
             LOG.warning(
-                "[PROXY] %s %s -> unavailable (%s) in %.2fs",
+                "[PROXY] %s %s -> unavailable (%s%s) in %.2fs",
                 method,
                 internal_path,
                 type(error).__name__,
+                tls_detail,
                 elapsed,
             )
             self.unavailable(502)
