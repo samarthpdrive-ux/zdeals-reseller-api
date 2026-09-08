@@ -1,4 +1,4 @@
-```python
+
 """
 ZDeals Bot - Wasmer Reseller API Gateway
 
@@ -1804,4 +1804,3 @@ if __name__ == "__main__":
     )
 
     server.serve_forever()
-```
