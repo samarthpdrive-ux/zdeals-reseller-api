@@ -28,7 +28,10 @@ BOT_INTERNAL_SECRET = os.environ.get("BOT_INTERNAL_SECRET", "").strip()
 HOST = os.environ.get("HOST", "0.0.0.0")
 PORT = int(os.environ.get("PORT", "80"))
 MAX_BODY_BYTES = 64 * 1024
-BACKEND_TIMEOUT = (3.0, 8.0)  # connect, read
+# The read budget is deliberately five seconds: combined with the three-second
+# connection budget, a non-streaming Render response cannot keep the client
+# waiting for the old 30-second urllib timeout.
+BACKEND_TIMEOUT = (3.0, 5.0)  # connect, read
 PRODUCT_CACHE_TTL = 30.0
 
 PUBLIC_V1_ORDER_PATH = re.compile(r"^/api/v1/order/[1-9][0-9]*$")
@@ -226,10 +229,15 @@ class GatewayHandler(BaseHTTPRequestHandler):
                 timeout=BACKEND_TIMEOUT,
                 allow_redirects=False,
             )
+        except requests.Timeout:
+            elapsed = time.monotonic() - started
+            LOG.warning("[PROXY] %s %s -> timeout in %.2fs", method, internal_path, elapsed)
+            self.unavailable(504)
+            return
         except requests.RequestException:
             elapsed = time.monotonic() - started
             LOG.warning("[PROXY] %s %s -> unavailable in %.2fs", method, internal_path, elapsed)
-            self.unavailable()
+            self.unavailable(502)
             return
 
         elapsed = time.monotonic() - started
