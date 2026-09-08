@@ -7,20 +7,20 @@ the configured delivery backend without exposing its address or credentials.
 from __future__ import annotations
 
 import hashlib
+import http.client
 import json
 import logging
 import os
 import re
+import socket
 import threading
 import time
 from dataclasses import dataclass
 from http import HTTPStatus
 from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
+from queue import Empty, LifoQueue
 from typing import Any
 from urllib.parse import parse_qs, urlsplit
-
-import requests
-from requests.adapters import HTTPAdapter
 
 
 BOT_INTERNAL_URL = os.environ.get("BOT_INTERNAL_URL", "").strip().rstrip("/")
@@ -109,17 +109,92 @@ class ProductCache:
 PRODUCT_CACHE = ProductCache()
 
 
-def build_backend_session() -> requests.Session:
-    """One process-wide pool for persistent Wasmer-to-Render connections."""
-    session = requests.Session()
-    adapter = HTTPAdapter(pool_connections=10, pool_maxsize=20, max_retries=0)
-    session.mount("https://", adapter)
-    session.mount("http://", adapter)
-    session.trust_env = False
-    return session
+@dataclass(frozen=True)
+class BackendResponse:
+    status: int
+    body: bytes
+    content_type: str | None
 
 
-BACKEND_SESSION = build_backend_session()
+class BackendTimeout(Exception):
+    """The backend exceeded the connection or response-read budget."""
+
+
+class BackendConnectionPool:
+    """Persistent HTTP/HTTPS connections using Python's standard library only."""
+
+    def __init__(self, maxsize: int = 20) -> None:
+        self._connections: LifoQueue[http.client.HTTPConnection] = LifoQueue(maxsize)
+
+    def _new_connection(self) -> http.client.HTTPConnection:
+        parsed = urlsplit(BOT_INTERNAL_URL)
+        if parsed.scheme not in {"http", "https"} or not parsed.hostname:
+            raise OSError("Invalid backend configuration.")
+        if parsed.path not in {"", "/"} or parsed.query or parsed.fragment:
+            raise OSError("Backend base URL may not include a path or query.")
+
+        port = parsed.port or (443 if parsed.scheme == "https" else 80)
+        connection_class = (
+            http.client.HTTPSConnection
+            if parsed.scheme == "https"
+            else http.client.HTTPConnection
+        )
+        return connection_class(parsed.hostname, port=port, timeout=3.0)
+
+    def _release(self, connection: http.client.HTTPConnection) -> None:
+        try:
+            self._connections.put_nowait(connection)
+        except Exception:
+            connection.close()
+
+    def request(
+        self,
+        method: str,
+        path: str,
+        query: str,
+        headers: dict[str, str],
+        body: bytes | None,
+    ) -> BackendResponse:
+        try:
+            connection = self._connections.get_nowait()
+        except Empty:
+            connection = self._new_connection()
+
+        try:
+            if connection.sock is None:
+                connection.timeout = 3.0
+
+            target = path + (f"?{query}" if query else "")
+            connection.request(method, target, body=body, headers=headers)
+
+            if connection.sock is not None:
+                connection.sock.settimeout(5.0)
+
+            response = connection.getresponse()
+            result = BackendResponse(
+                status=response.status,
+                body=response.read(),
+                content_type=response.getheader("Content-Type"),
+            )
+            should_close = response.will_close
+
+        except socket.timeout as error:
+            connection.close()
+            raise BackendTimeout() from error
+
+        except (OSError, http.client.HTTPException):
+            connection.close()
+            raise
+
+        if should_close:
+            connection.close()
+        else:
+            self._release(connection)
+
+        return result
+
+
+BACKEND_POOL = BackendConnectionPool()
 
 
 class GatewayHandler(BaseHTTPRequestHandler):
@@ -184,13 +259,13 @@ class GatewayHandler(BaseHTTPRequestHandler):
             return None
         return self.rfile.read(length)
 
-    def send_backend_response(self, response: requests.Response) -> None:
+    def send_backend_response(self, response: BackendResponse) -> None:
         # Never turn an upstream redirect into a public redirect.  In particular,
         # Location is intentionally not copied from the upstream response.
-        if 300 <= response.status_code < 400 or contains_internal_data(response.content):
+        if 300 <= response.status < 400 or contains_internal_data(response.body):
             self.unavailable()
             return
-        self.send_bytes(response.status_code, response.content, response.headers.get("Content-Type"))
+        self.send_bytes(response.status, response.body, response.content_type)
 
     def forward(
         self,
@@ -222,29 +297,28 @@ class GatewayHandler(BaseHTTPRequestHandler):
 
         started = time.monotonic()
         try:
-            response = BACKEND_SESSION.request(
+            response = BACKEND_POOL.request(
                 method=method,
-                url=backend_url(internal_path, query),
-                data=body,
+                path=internal_path,
+                query=query,
                 headers=headers,
-                timeout=BACKEND_TIMEOUT,
-                allow_redirects=False,
+                body=body,
             )
-        except requests.Timeout:
+        except BackendTimeout:
             elapsed = time.monotonic() - started
             LOG.warning("[PROXY] %s %s -> timeout in %.2fs", method, internal_path, elapsed)
             self.unavailable(504)
             return
-        except requests.RequestException:
+        except (OSError, http.client.HTTPException):
             elapsed = time.monotonic() - started
             LOG.warning("[PROXY] %s %s -> unavailable in %.2fs", method, internal_path, elapsed)
             self.unavailable(502)
             return
 
         elapsed = time.monotonic() - started
-        LOG.info("[PROXY] %s %s -> %s in %.2fs", method, internal_path, response.status_code, elapsed)
-        if cache_products and not query and response.status_code == 200 and not contains_internal_data(response.content):
-            PRODUCT_CACHE.put(api_key, response.content, safe_content_type(response.headers.get("Content-Type")))
+        LOG.info("[PROXY] %s %s -> %s in %.2fs", method, internal_path, response.status, elapsed)
+        if cache_products and not query and response.status == 200 and not contains_internal_data(response.body):
+            PRODUCT_CACHE.put(api_key, response.body, safe_content_type(response.content_type))
         self.send_backend_response(response)
 
     def validated_order_body(self, body: bytes) -> bytes | None:
